@@ -77,6 +77,85 @@ def recommend_tier(hours_per_day: float, interruptible: bool, reserved_discount:
     return "on_demand"
 
 
+# --- "Your Turn" Extension 1 support ---------------------------------------
+# Per-GPU-type spot interruption rate (per-hour reclaim probability). Scarcer /
+# newer / bigger accelerators are reclaimed more aggressively on the spot market.
+SPOT_INTERRUPT_RATE = {
+    "B200": 0.18, "H200": 0.12, "H100": 0.08, "MI300X": 0.10,
+    "A100": 0.05, "A10G": 0.03, "L4": 0.02,
+}
+
+
+def interruption_rate_for(gpu_type: str, default: float = 0.05) -> float:
+    """Look up the spot reclaim rate for a GPU type (Extension 1)."""
+    return SPOT_INTERRUPT_RATE.get(gpu_type, default)
+
+
+def recommend_tier_v2(
+    hours_per_day: float,
+    interruptible: bool,
+    gpu_type: str = "H100",
+    on_demand_hr: float = 1.0,
+    reserved_1yr_hr: float | None = None,
+    reserved_3yr_hr: float | None = None,
+    spot_hr: float | None = None,
+    max_spot_interrupt: float = 0.15,
+) -> dict:
+    """Interruption-aware, term-aware purchasing policy (Extension 1).
+
+    Improvements over `recommend_tier`:
+      1. Chooses the reserved TERM (1yr vs 3yr) from the real break-even of each
+         term's discount instead of assuming 3yr always wins.
+      2. Uses the per-GPU-type spot interruption rate. If a job is interruptible
+         but the accelerator is reclaimed too aggressively (rate > max_spot_interrupt),
+         spot rework can eat the discount, so we fall back to a reserved term.
+
+    Returns a dict: {tier, reserved_term, interrupt_rate, reason}.
+    """
+    duty = max(0.0, hours_per_day) / 24.0
+    rate = interruption_rate_for(gpu_type)
+
+    # Effective discounts of each reserved term, from live catalog prices.
+    disc_1yr = 1.0 - (reserved_1yr_hr / on_demand_hr) if reserved_1yr_hr else 0.0
+    disc_3yr = 1.0 - (reserved_3yr_hr / on_demand_hr) if reserved_3yr_hr else 0.0
+    be_1yr = break_even_utilization(disc_1yr)
+    be_3yr = break_even_utilization(disc_3yr)
+
+    def _reserved_choice(reason: str) -> dict:
+        # 3yr needs higher utilization to amortize; only commit to it above its
+        # break-even, else the shorter 1yr term is the safer commitment.
+        if duty >= be_3yr and disc_3yr >= disc_1yr:
+            return {"tier": "reserved", "reserved_term": "3yr",
+                    "interrupt_rate": rate, "reason": reason + f"; duty {duty:.0%} >= 3yr break-even {be_3yr:.0%}"}
+        return {"tier": "reserved", "reserved_term": "1yr",
+                "interrupt_rate": rate, "reason": reason + f"; duty {duty:.0%} below 3yr break-even {be_3yr:.0%}, 1yr safer"}
+
+    if interruptible and hours_per_day < 24:
+        if rate <= max_spot_interrupt:
+            return {"tier": "spot", "reserved_term": None, "interrupt_rate": rate,
+                    "reason": f"interruptible & spot reclaim {rate:.0%} <= {max_spot_interrupt:.0%} cap"}
+        # Too flaky for spot — commit to reserved instead of paying rework.
+        return _reserved_choice(f"interruptible but spot reclaim {rate:.0%} too high")
+
+    if duty >= be_1yr:
+        return _reserved_choice("steady high-duty workload")
+    return {"tier": "on_demand", "reserved_term": None, "interrupt_rate": rate,
+            "reason": f"spiky/low duty {duty:.0%} below 1yr break-even {be_1yr:.0%}"}
+
+
+def cache_is_worth_it(avg_reads: float, write_cost: float = 1.25,
+                      read_discount: float = 0.10) -> bool:
+    """Whether prompt caching pays off given how many times a cached prefix is re-read.
+
+    Writing to the cache costs ~`write_cost`x a normal input token; each cached
+    read costs only `read_discount`x. Break-even reads N* solves:
+        write_cost + N*read_discount  <  (N+1)*1   (vs paying full price each time)
+    Caching wins once average reads clear that threshold.
+    """
+    breakeven = (write_cost - 1.0) / (1.0 - read_discount) if read_discount < 1.0 else float("inf")
+    return avg_reads > breakeven
+
+
 def spot_checkpoint_cost(
     job_hours: float,
     spot_hr: float,

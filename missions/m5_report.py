@@ -9,6 +9,7 @@ import os
 from missions._common import num, catalog_by_type, ROOT
 from finops import report, sustainability
 from missions import m1_efficiency_audit, m2_inference_levers, m3_purchasing
+from extensions import ext4_reasoning_budget, ext5_carbon_aware
 
 DAYS = 30
 # one tier down for over-provisioned ("util-lie") GPUs
@@ -52,7 +53,29 @@ def run(verbose: bool = True) -> dict:
         "best_region": min(sustainability.REGION_CARBON, key=sustainability.REGION_CARBON.get),
     }
 
-    md = report.build_report(baseline, optimized, levers, sustainability=sust)
+    # --- richer analysis context (Part C) sourced from missions + extensions ---
+    reasoning = ext4_reasoning_budget.run(verbose=False)
+    carbon = ext5_carbon_aware.run(verbose=False)
+    extensions_done = [
+        "**Ext 1 — interruption-/term-aware `recommend_tier()`**: adds per-GPU spot "
+        "reclaim rate + 1yr/3yr break-even; identical when spot is calm, saves "
+        "~$1.2k/mo of rework in a reclaim-spike stress test.",
+        "**Ext 4 — reasoning budget**: reasoning is "
+        f"{reasoning['reasoning_frac_traffic']*100:.1f}% of traffic but "
+        f"{reasoning['reasoning_frac_energy']*100:.0f}% of energy; capping to 3% saves "
+        f"~{reasoning['wh_saved_day']:,} Wh/day.",
+        "**Ext 5 — carbon-aware scheduling**: moving the interruptible fleet to "
+        f"{carbon['cleanest_region']} cuts {carbon['carbon_saved_kg_month']:,} kg CO2e/mo "
+        f"(~92%) and ${carbon['usd_saved_month']:,.0f}/mo of electricity.",
+    ]
+
+    md = report.build_report(
+        baseline, optimized, levers, sustainability=sust,
+        util_lies=r1["lies"], rightsize_map=RIGHTSIZE_MAP,
+        recommendations=r3["recommendations"],
+        region_rows=carbon["regions"], reasoning=reasoning,
+        extensions=extensions_done,
+    )
     out_md = os.path.join(ROOT, "outputs", "report.md")
     os.makedirs(os.path.dirname(out_md), exist_ok=True)
     with open(out_md, "w") as f:

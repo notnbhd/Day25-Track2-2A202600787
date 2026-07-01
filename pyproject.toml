@@ -1,0 +1,11 @@
+[project]
+name = "day25-track2-2a202600787"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "matplotlib>=3.7",
+    "pandas>=2.0",
+    "pytest>=7.4",
+]
